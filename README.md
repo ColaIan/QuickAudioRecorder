@@ -13,10 +13,13 @@ It sits quietly in your system tray and is always ready with a single click or g
 <img width="575" height="724" alt="image" src="https://github.com/user-attachments/assets/b35131bc-1ff8-41e1-87b5-1e472f9da981" />
 
 
+-   **Capture Targets:**
+    -   🖥️ **Hardware Output Device:** Record system-wide audio directly from your chosen physical speakers.
+    -   🎯 **Specific Application:** Isolate and record audio *only* from a selected application (e.g., Discord or Firefox) without capturing background system noises, powered by WASAPI Process Loopback.
 -   **Modes:**
     -   🎤 **Microphone:** Record your voice.
-    -   🔊 **System Audio:** Record what you hear (Loopback).
-    -   🎙️+🔊 **Both:** Record both tracks simultaneously (mixed).
+    -   🔊 **Loopback:** Record what you hear (or what the app is playing).
+    -   🎙️+🔊 **Both:** Record both tracks simultaneously (mixed into one file).
 -   **Post-Processing:**
     -   **Auto-Normalize:** Automatically adjusts volume to optimal levels after recording.
     -   **Clipboard Integration:** Automatically copies the file (or file path) to your clipboard.
@@ -34,17 +37,25 @@ It sits quietly in your system tray and is always ready with a single click or g
 
 ## Usage
 
-1.  **Right-click** the tray icon to open **Settings**.
-2.  Select your **Microphone** and **Output Folder**.
-3.  Set your **Hotkeys** (optional).
-4.  **Left-click** the tray icon or use a hotkey to start recording.
-5.  Click again to stop. The file is saved and ready to use!
+1.  The **Settings** window opens immediately upon launch.
+2.  Choose your **Capture Target** (Hardware Output or Specific Application).
+3.  Select your **Microphone** and **Output Folder**.
+4.  Set your **Hotkeys** and **Tray Icon Behavior** (optional).
+5.  Close the settings window to minimize to the tray. 
+6.  **Left-click** the tray icon or use your configured hotkey to start recording. Click again to stop.
 
 ## Development
 
 ### Requirements
 -   Python 3.12+
--   `pip install -r requirements.txt`
+-   Install dependencies: `pip install -r requirements.txt`
+-   Core libraries include `soundcard`, `soundfile`, `proctap` (for WASAPI loopback isolation), `psutil`, and `PyQt6`.
+
+### Testing
+This project follows Test-Driven Development (TDD) for core audio logic. To run the test suite:
+```bash
+pytest tests/
+```
 
 ### Build from Source
 To create the standalone executable:

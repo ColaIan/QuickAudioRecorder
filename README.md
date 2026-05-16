@@ -44,7 +44,7 @@ It sits quietly in your system tray and is always ready with a single click or g
 
 ### Requirements
 -   Python 3.12+
--   `pip install PyQt6 soundcard soundfile numpy lameenc keyboard`
+-   `pip install -r requirements.txt`
 
 ### Build from Source
 To create the standalone executable:

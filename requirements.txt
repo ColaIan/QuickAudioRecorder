@@ -1,0 +1,9 @@
+PyQt6
+soundcard
+soundfile
+numpy
+lameenc
+keyboard
+proc-tap
+psutil
+pytest

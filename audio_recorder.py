@@ -35,18 +35,71 @@ class RawRecorder(threading.Thread):
         self.stop_event.set()
         self.join()
 
+class ProcTapRecorder(threading.Thread):
+    """
+    Helper thread to record a specific application's audio to a WAV file using ProcTap.
+    """
+    def __init__(self, pid, filepath):
+        super().__init__()
+        self.pid = pid
+        self.filepath = filepath
+        self.samplerate = 48000
+        self.channels = 2
+        self.stop_event = threading.Event()
+        self.error = None
+        self.max_amp_seen = 0.0
+        self.chunks_read = 0
+
+    def run(self):
+        try:
+            import proctap
+            import soundfile as sf
+            import numpy as np
+            
+            print(f"[ProcTapRecorder] Starting capture for PID {self.pid}...")
+            capture = proctap.ProcessAudioCapture(self.pid)
+            capture.start()
+            
+            with sf.SoundFile(self.filepath, mode='w', samplerate=self.samplerate, channels=self.channels) as f_wav:
+                while not self.stop_event.is_set():
+                    data = capture.read(timeout=0.1)
+                    if data:
+                        np_data = np.frombuffer(data, dtype=np.float32).reshape(-1, self.channels)
+                        f_wav.write(np_data)
+                        
+                        # Debugging amplitude
+                        amp = np.max(np.abs(np_data))
+                        if amp > self.max_amp_seen:
+                            self.max_amp_seen = amp
+                        self.chunks_read += 1
+                        
+            capture.stop()
+            capture.close()
+            print(f"[ProcTapRecorder] Finished PID {self.pid}. Chunks: {self.chunks_read}, Max Amp: {self.max_amp_seen:.4f}")
+            if self.max_amp_seen == 0.0 and self.chunks_read > 0:
+                print(f"[ProcTapRecorder] WARNING: All captured chunks were perfect silence (0.0). Application may be bypassing WASAPI loopback.")
+        except Exception as e:
+            print(f"[ProcTapRecorder] Error: {e}")
+            self.error = str(e)
+
+    def stop(self):
+        self.stop_event.set()
+        self.join()
+
 class AudioRecorder(threading.Thread):
     """
     Orchestrates recording from Microphone, Loopback, or Both.
     """
     def __init__(self, mic_id, source_mode, output_folder, output_format="mp3", 
-                 normalize=False, on_finish_callback=None):
+                 normalize=False, target_pid=None, speaker_id=None, on_finish_callback=None):
         super().__init__()
         self.mic_id = mic_id
         self.source_mode = source_mode # "mic", "loopback", "both"
         self.output_folder = output_folder
         self.output_format = output_format.lower()
         self.normalize = normalize
+        self.target_pid = target_pid
+        self.speaker_id = speaker_id
         self.callback = on_finish_callback
         
         self.recording = False
@@ -58,19 +111,27 @@ class AudioRecorder(threading.Thread):
         self.temp_files = []
         self.recorders = []
 
-    def _get_device(self, is_loopback):
+    def _get_device(self, is_loopback=False):
         if is_loopback:
-            # For loopback, we try to find the default speaker's loopback
-            default_speaker = sc.default_speaker()
+            target_speaker_name = None
+            if self.speaker_id:
+                for speaker in sc.all_speakers():
+                    if speaker.id == self.speaker_id:
+                        target_speaker_name = speaker.name
+                        break
+            
+            if target_speaker_name is None:
+                target_speaker_name = sc.default_speaker().name
+                
             mics = sc.all_microphones(include_loopback=True)
             # Try exact name match
-            loopback_mic = next((m for m in mics if m.name == default_speaker.name), None)
+            loopback_mic = next((m for m in mics if m.name == target_speaker_name and m.isloopback), None)
             # Try fuzzy match
             if not loopback_mic:
-                loopback_mic = next((m for m in mics if default_speaker.name in m.name), None)
+                loopback_mic = next((m for m in mics if target_speaker_name in m.name and m.isloopback), None)
             
             if not loopback_mic:
-                raise Exception("Could not detect System Audio loopback device.")
+                raise Exception(f"Could not detect System Audio loopback device for '{target_speaker_name}'.")
             return loopback_mic
         else:
             return sc.get_microphone(self.mic_id, include_loopback=False)
@@ -83,29 +144,53 @@ class AudioRecorder(threading.Thread):
         
         try:
             # 1. Setup Recorders
+            is_per_app = self.target_pid is not None
+            
+            # Use root PID for the target to ensure we capture the whole tree (browser sandboxes)
+            actual_pid = self.target_pid
+            if is_per_app:
+                try:
+                    from process_utils import get_root_pid
+                    actual_pid = get_root_pid(self.target_pid)
+                    print(f"Targeting root PID {actual_pid} (derived from selected {self.target_pid})")
+                except Exception as e:
+                    print(f"Error resolving root PID: {e}")
+            
+            # If using ProcTap, its fixed sample rate is 48000. 
+            # We must match this for hardware mics to avoid mixing different sample rates.
+            target_sr = 48000 if is_per_app else 44100
+            
             if self.source_mode == "both":
                 # Need two recorders
                 dev_mic = self._get_device(is_loopback=False)
-                dev_loop = self._get_device(is_loopback=True)
                 
                 t1 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
                 t2 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
                 self.temp_files = [t1, t2]
                 
-                self.recorders.append(RawRecorder(dev_mic, t1))
-                self.recorders.append(RawRecorder(dev_loop, t2))
+                self.recorders.append(RawRecorder(dev_mic, t1, samplerate=target_sr))
+                
+                if is_per_app:
+                    self.recorders.append(ProcTapRecorder(actual_pid, t2))
+                else:
+                    dev_loop = self._get_device(is_loopback=True)
+                    self.recorders.append(RawRecorder(dev_loop, t2, samplerate=target_sr))
                 
             elif self.source_mode == "loopback":
-                dev = self._get_device(is_loopback=True)
                 t1 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
                 self.temp_files = [t1]
-                self.recorders.append(RawRecorder(dev, t1))
+                
+                if is_per_app:
+                    self.recorders.append(ProcTapRecorder(actual_pid, t1))
+                else:
+                    dev = self._get_device(is_loopback=True)
+                    self.recorders.append(RawRecorder(dev, t1, samplerate=target_sr))
                 
             else: # mic
                 dev = self._get_device(is_loopback=False)
                 t1 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
                 self.temp_files = [t1]
-                self.recorders.append(RawRecorder(dev, t1))
+                self.recorders.append(RawRecorder(dev, t1, samplerate=target_sr))
 
             print(f"Starting recording mode: {self.source_mode}")
 
@@ -113,14 +198,22 @@ class AudioRecorder(threading.Thread):
             for r in self.recorders:
                 r.start()
             
-            # Wait for stop signal
-            self.stop_event.wait()
+            # Wait for stop signal or for a recorder to crash
+            while not self.stop_event.is_set():
+                for r in self.recorders:
+                    if not r.is_alive():
+                        # A recorder thread died prematurely
+                        self.stop_event.set()
+                        if r.error:
+                            self.error_message = f"Recording stopped because the application closed. ({r.error})"
+                        break
+                self.stop_event.wait(0.5)
             
             # 3. Stop Recording
             for r in self.recorders:
                 r.stop()
-                if r.error:
-                    raise Exception(f"Recorder error: {r.error}")
+                if r.error and not self.error_message:
+                    self.error_message = f"Recording stopped because the application closed. ({r.error})"
 
             # 4. Mix/Process
             if len(self.temp_files) == 2:

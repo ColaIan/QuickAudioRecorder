@@ -40,7 +40,7 @@ https://github.com/user-attachments/assets/14238816-c1ee-4914-9211-5f0007bfe999
     -   🔊 **Loopback:** Record what you hear (or what the app is playing).
     -   🎙️+🔊 **Both:** Record both tracks simultaneously (mixed into one file).
 -   **Post-Processing:**
-    -   **Auto-Normalize:** Automatically adjusts volume to optimal levels after recording.
+    -   **Auto-Normalize:** Lifts the main voice/body of each source before mixing and limits sharp peaks so brief spikes do not bury the recording.
     -   **Clipboard Integration:** Automatically copies the file (or file path) to your clipboard.
     -   **Clean Workflow:** Option to move the file to a temp folder and copy it, keeping your desktop clean.
 -   **Control:**

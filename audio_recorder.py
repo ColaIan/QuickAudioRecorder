@@ -42,6 +42,12 @@ QUALITY_CONFIG = {
     },
 }
 
+NORMALIZE_ACTIVE_FLOOR = 0.001
+NORMALIZE_TARGET_LEVEL = 0.12
+NORMALIZE_MAX_GAIN = 8.0
+NORMALIZE_REFERENCE_PERCENTILE = 95
+NORMALIZE_LIMIT = 0.98
+
 
 def build_output_profile(fmt, quality, stereo):
     fmt_key = str(fmt or "").strip().lower()
@@ -302,18 +308,7 @@ class AudioRecorder(threading.Thread):
                     self.error_message = f"Recording stopped because the application closed. ({r.error})"
 
             # 4. Mix/Process
-            if len(self.temp_files) == 2:
-                mixed_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-                self._mix_audio(self.temp_files[0], self.temp_files[1], mixed_wav, subtype)
-                # Use mixed file as source for next steps
-                source_wav = mixed_wav
-                self.temp_files.append(mixed_wav) # Mark for cleanup
-            else:
-                source_wav = self.temp_files[0]
-
-            # 5. Normalization
-            if self.normalize:
-                self._normalize_audio(source_wav)
+            source_wav = self._prepare_source_wav(subtype)
             
             # 6. Finalize
             if not os.path.exists(self.output_folder):
@@ -342,7 +337,33 @@ class AudioRecorder(threading.Thread):
     def stop(self):
         self.stop_event.set()
 
-    def _mix_audio(self, file1, file2, out_file, subtype):
+    def _prepare_source_wav(self, subtype):
+        if len(self.temp_files) == 2:
+            if self.normalize:
+                self._normalize_audio(self.temp_files[0])
+                self._normalize_audio(self.temp_files[1])
+
+            mixed_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+            self._mix_audio(
+                self.temp_files[0],
+                self.temp_files[1],
+                mixed_wav,
+                subtype,
+                limit_output=self.normalize,
+            )
+            self.temp_files.append(mixed_wav) # Mark for cleanup
+
+            if self.normalize:
+                self._limit_audio(mixed_wav)
+
+            return mixed_wav
+
+        source_wav = self.temp_files[0]
+        if self.normalize:
+            self._normalize_audio(source_wav)
+        return source_wav
+
+    def _mix_audio(self, file1, file2, out_file, subtype, limit_output=False):
         d1, sr1 = sf.read(file1, always_2d=True)
         d2, sr2 = sf.read(file2, always_2d=True)
 
@@ -367,25 +388,46 @@ class AudioRecorder(threading.Thread):
             shape = (pad_width, d2.shape[1])
             d2 = np.concatenate((d2, np.zeros(shape, dtype=d2.dtype)))
             
-        # Mix (Sum)
         mixed = d1 + d2
-        # Clip
-        mixed = np.clip(mixed, -1.0, 1.0)
+        if limit_output:
+            mixed = self._apply_limiter(mixed)
+        else:
+            mixed = np.clip(mixed, -1.0, 1.0)
         
         sf.write(out_file, mixed, sr1, format="WAV", subtype=subtype)
 
     def _normalize_audio(self, filepath):
         try:
             info = sf.info(filepath)
-            data, sr = sf.read(filepath)
-            max_val = np.max(np.abs(data))
-            if max_val > 0:
-                target_peak = 0.99 
-                factor = target_peak / max_val
-                data = data * factor
-                sf.write(filepath, data, sr, format=info.format, subtype=info.subtype)
+            data, sr = sf.read(filepath, always_2d=True)
+            data = self._normalize_audio_data(data)
+            sf.write(filepath, data, sr, format=info.format, subtype=info.subtype)
         except Exception as e:
             print(f"Normalization failed: {e}")
+
+    def _normalize_audio_data(self, data):
+        active = np.abs(data)
+        active = active[active >= NORMALIZE_ACTIVE_FLOOR]
+        if active.size == 0:
+            return self._apply_limiter(data)
+
+        rms = float(np.sqrt(np.mean(active ** 2)))
+        percentile = float(np.percentile(active, NORMALIZE_REFERENCE_PERCENTILE))
+        reference_level = max(rms, percentile)
+        if not np.isfinite(reference_level) or reference_level <= 0:
+            return self._apply_limiter(data)
+
+        gain = min(NORMALIZE_TARGET_LEVEL / reference_level, NORMALIZE_MAX_GAIN)
+        return self._apply_limiter(data * gain)
+
+    def _limit_audio(self, filepath):
+        info = sf.info(filepath)
+        data, sr = sf.read(filepath, always_2d=True)
+        data = self._apply_limiter(data)
+        sf.write(filepath, data, sr, format=info.format, subtype=info.subtype)
+
+    def _apply_limiter(self, data):
+        return np.clip(data, -NORMALIZE_LIMIT, NORMALIZE_LIMIT)
 
     def _write_final_output(self, source_wav, final_filepath):
         if self.profile["encoder"] == "lameenc":

@@ -249,6 +249,78 @@ class OutputProfileTests(unittest.TestCase):
             self.assertEqual(info.format, "FLAC")
             self.assertEqual(info.subtype, "PCM_24")
 
+    def test_normalize_audio_raises_main_voice_despite_single_spike(self):
+        import os
+        import tempfile
+
+        import numpy as np
+        import soundfile as sf
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            filepath = os.path.join(temp_dir, "source.wav")
+            data = np.full((16000, 1), 0.02, dtype=np.float32)
+            data[4000, 0] = 1.0
+            sf.write(filepath, data, 16000, format="WAV", subtype="FLOAT")
+
+            recorder = self._make_recorder("wav", "balanced", stereo=False)
+            recorder._normalize_audio(filepath)
+
+            normalized, _ = sf.read(filepath, always_2d=True)
+            body = np.delete(normalized[:, 0], 4000)
+            self.assertGreater(np.median(np.abs(body)), 0.10)
+            self.assertLessEqual(np.max(np.abs(normalized)), 0.9801)
+
+    def test_prepare_source_wav_normalizes_both_sources_before_mixing(self):
+        import os
+        import tempfile
+
+        import numpy as np
+        import soundfile as sf
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            mic_file = os.path.join(temp_dir, "mic.wav")
+            loop_file = os.path.join(temp_dir, "loop.wav")
+            mic = np.full((16000, 1), 0.02, dtype=np.float32)
+            mic[4000, 0] = 1.0
+            loopback = np.full((16000, 1), 0.01, dtype=np.float32)
+            sf.write(mic_file, mic, 16000, format="WAV", subtype="FLOAT")
+            sf.write(loop_file, loopback, 16000, format="WAV", subtype="FLOAT")
+
+            recorder = self._make_recorder("wav", "balanced", stereo=False)
+            recorder.normalize = True
+            recorder.temp_files = [mic_file, loop_file]
+
+            mixed_file = recorder._prepare_source_wav("FLOAT")
+            mixed, _ = sf.read(mixed_file, always_2d=True)
+
+            body = np.delete(mixed[:, 0], 4000)
+            self.assertGreater(np.median(np.abs(body)), 0.15)
+            self.assertLessEqual(np.max(np.abs(mixed)), 0.9801)
+            self.assertIn(mixed_file, recorder.temp_files)
+
+    def test_normalize_audio_preserves_stereo_channel_balance(self):
+        import os
+        import tempfile
+
+        import numpy as np
+        import soundfile as sf
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            filepath = os.path.join(temp_dir, "source.wav")
+            data = np.tile(np.array([[0.04, 0.02]], dtype=np.float32), (16000, 1))
+            data[4000] = [1.0, 0.5]
+            sf.write(filepath, data, 16000, format="WAV", subtype="FLOAT")
+
+            recorder = self._make_recorder("wav", "balanced", stereo=True)
+            recorder._normalize_audio(filepath)
+
+            normalized, _ = sf.read(filepath, always_2d=True)
+            self.assertAlmostEqual(
+                normalized[1000, 0] / normalized[1000, 1],
+                2.0,
+                places=5,
+            )
+
     def test_invalid_profile_keys_raise_value_error(self):
         with self.assertRaises(ValueError):
             build_output_profile("ogg", "balanced", stereo=False)

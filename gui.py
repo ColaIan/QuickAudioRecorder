@@ -11,8 +11,10 @@ from PyQt6.QtGui import QIcon, QAction, QColor, QPixmap, QPainter, QBrush, QKeyS
 from PyQt6.QtCore import pyqtSignal, QObject, Qt, QUrl, QMimeData, QDir
 import soundcard as sc
 import keyboard
+import psutil
 from audio_recorder import AudioRecorder, get_devices
 from clipboard_utils import copy_file_to_clipboard
+from process_utils import get_active_applications
 
 CONFIG_FILE = "settings.json"
 
@@ -108,6 +110,36 @@ class SettingsWindow(QMainWindow):
         container.setLayout(layout)
         self.setCentralWidget(container)
 
+        # Capture Target Selection
+        group_source = QGroupBox("Capture Target (Output Source)")
+        layout_source = QVBoxLayout()
+        
+        self.combo_source = QComboBox()
+        self.combo_source.addItems(["Hardware Output Device", "Specific App"])
+        self.combo_source.currentIndexChanged.connect(self.on_source_changed)
+        layout_source.addWidget(self.combo_source)
+        
+        layout_hw = QHBoxLayout()
+        self.combo_hardware = QComboBox()
+        self.btn_refresh_hw = QPushButton("Refresh Devices")
+        self.btn_refresh_hw.clicked.connect(self.refresh_hw)
+        layout_hw.addWidget(self.combo_hardware)
+        layout_hw.addWidget(self.btn_refresh_hw)
+        layout_source.addLayout(layout_hw)
+        
+        layout_app = QHBoxLayout()
+        self.combo_app = QComboBox()
+        self.combo_app.setEnabled(False)
+        self.btn_refresh_app = QPushButton("Refresh Apps")
+        self.btn_refresh_app.setEnabled(False)
+        self.btn_refresh_app.clicked.connect(self.refresh_apps)
+        layout_app.addWidget(self.combo_app)
+        layout_app.addWidget(self.btn_refresh_app)
+        layout_source.addLayout(layout_app)
+        
+        group_source.setLayout(layout_source)
+        layout.addWidget(group_source)
+
         # Microphone
         group_mic = QGroupBox("Input Device")
         layout_mic = QVBoxLayout()
@@ -181,6 +213,7 @@ class SettingsWindow(QMainWindow):
         btn_save.clicked.connect(self.save_settings)
         layout.addWidget(btn_save)
 
+        self.refresh_hw()
         self.refresh_devices()
 
     def refresh_devices(self):
@@ -196,6 +229,42 @@ class SettingsWindow(QMainWindow):
             self.combo_mic.setCurrentIndex(default_index)
         except Exception as e:
             print(f"Error refreshing devices: {e}")
+
+    def refresh_hw(self):
+        self.combo_hardware.clear()
+        try:
+            speakers = get_devices(include_loopback=True)
+            default_spk = sc.default_speaker()
+            default_index = 0
+            for i, s in enumerate(speakers):
+                self.combo_hardware.addItem(f"{s['name']}", s['id'])
+                if s['id'] == default_spk.id:
+                    default_index = i
+            if self.combo_hardware.count() > 0:
+                self.combo_hardware.setCurrentIndex(default_index)
+        except Exception as e:
+            print(f"Error refreshing hardware devices: {e}")
+
+    def on_source_changed(self, index):
+        is_app = (self.combo_source.currentText() == "Specific App")
+        self.combo_app.setEnabled(is_app)
+        self.btn_refresh_app.setEnabled(is_app)
+        self.combo_hardware.setEnabled(not is_app)
+        self.btn_refresh_hw.setEnabled(not is_app)
+        
+        if is_app and self.combo_app.count() == 0:
+            self.refresh_apps()
+        if not is_app and self.combo_hardware.count() == 0:
+            self.refresh_hw()
+
+    def refresh_apps(self):
+        self.combo_app.clear()
+        try:
+            apps = get_active_applications()
+            for app in apps:
+                self.combo_app.addItem(f"{app['title']} ({app['name']})", app['pid'])
+        except Exception as e:
+            print(f"Error refreshing apps: {e}")
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder", options=QFileDialog.Option.DontUseNativeDialog)
@@ -216,6 +285,22 @@ class SettingsWindow(QMainWindow):
                 if saved_id:
                     idx = self.combo_mic.findData(saved_id)
                     if idx >= 0: self.combo_mic.setCurrentIndex(idx)
+
+                source_mode = data.get("source", "Hardware Output Device")
+                if source_mode == "System-Wide": source_mode = "Hardware Output Device"
+                source_idx = self.combo_source.findText(source_mode)
+                if source_idx >= 0: self.combo_source.setCurrentIndex(source_idx)
+
+                saved_hw_id = data.get("speaker_id")
+                if saved_hw_id and source_mode == "Hardware Output Device":
+                    idx = self.combo_hardware.findData(saved_hw_id)
+                    if idx >= 0: self.combo_hardware.setCurrentIndex(idx)
+
+                saved_pid = data.get("target_pid")
+                if saved_pid and source_mode == "Specific App":
+                    self.refresh_apps()
+                    pid_idx = self.combo_app.findData(saved_pid)
+                    if pid_idx >= 0: self.combo_app.setCurrentIndex(pid_idx)
 
                 mode = data.get("tray_click_mode", "Last Used")
                 mode_idx = self.combo_left_click.findText(mode)
@@ -245,6 +330,9 @@ class SettingsWindow(QMainWindow):
 
     def get_settings(self):
         return {
+            "source": self.combo_source.currentText(),
+            "target_pid": self.combo_app.currentData(),
+            "speaker_id": self.combo_hardware.currentData(),
             "device_id": self.combo_mic.currentData(),
             "output_folder": self.lbl_folder.text(),
             "format": self.combo_fmt.currentText(),
@@ -284,6 +372,9 @@ class TrayApplication(QObject):
         
         self.tray_icon.showMessage("Ready", "Left-click to toggle recording.", QSystemTrayIcon.MessageIcon.Information, 2000)
         self.register_hotkeys()
+        
+        # Open settings on startup
+        self.open_settings()
 
     def generate_icons(self):
         if not os.path.exists(self.icon_idle_path):
@@ -374,6 +465,15 @@ class TrayApplication(QObject):
         settings = self.settings_window.get_settings()
         target_id = settings['device_id']
         
+        is_app = settings.get('source') == "Specific App"
+        target_pid = settings.get('target_pid') if is_app else None
+        speaker_id = settings.get('speaker_id') if not is_app else None
+        
+        if is_app:
+            if not target_pid or not psutil.pid_exists(target_pid):
+                self.tray_icon.showMessage("Error", "Application not found. Please refresh the list.", QSystemTrayIcon.MessageIcon.Warning, 3000)
+                return
+        
         def finish_callback(path, error):
             self.signals.recording_finished.emit(path if path else "", error if error else "")
 
@@ -383,6 +483,8 @@ class TrayApplication(QObject):
             output_folder=settings['output_folder'],
             output_format=settings['format'],
             normalize=settings['normalize'],
+            target_pid=target_pid,
+            speaker_id=speaker_id,
             on_finish_callback=finish_callback
         )
         self.recorder.start()

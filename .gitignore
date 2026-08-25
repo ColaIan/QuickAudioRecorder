@@ -24,3 +24,7 @@ settings.json
 # IDE
 .vscode/
 .idea/
+*.mp3  
+*.wav  
+*.png  
+debug_com.py 

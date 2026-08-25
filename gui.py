@@ -3,12 +3,14 @@ import os
 import json
 import shutil
 import tempfile
+import ctypes
+from ctypes import wintypes
 from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QMainWindow, 
                              QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
                              QPushButton, QFileDialog, QMessageBox, QGroupBox, 
                              QLineEdit, QFormLayout, QCheckBox)
 from PyQt6.QtGui import QIcon, QAction, QColor, QPixmap, QPainter, QBrush, QKeySequence
-from PyQt6.QtCore import pyqtSignal, QObject, Qt, QUrl, QMimeData, QDir
+from PyQt6.QtCore import pyqtSignal, QObject, Qt, QUrl, QMimeData, QDir, QEvent
 import soundcard as sc
 import keyboard
 import psutil
@@ -25,6 +27,231 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
+WINDOWS_MODIFIER_KEYS = {
+    "alt": 0x0001,
+    "ctrl": 0x0002,
+    "control": 0x0002,
+    "shift": 0x0004,
+    "windows": 0x0008,
+    "win": 0x0008,
+}
+
+WINDOWS_SPECIAL_KEYS = {
+    "backspace": 0x08,
+    "tab": 0x09,
+    "enter": 0x0D,
+    "return": 0x0D,
+    "esc": 0x1B,
+    "escape": 0x1B,
+    "space": 0x20,
+    "left": 0x25,
+    "up": 0x26,
+    "right": 0x27,
+    "down": 0x28,
+    "delete": 0x2E,
+    "plus": 0xBB,
+    "comma": 0xBC,
+    "-": 0xBD,
+    "minus": 0xBD,
+    ".": 0xBE,
+    "period": 0xBE,
+    "/": 0xBF,
+    "slash": 0xBF,
+}
+
+for number in range(1, 13):
+    WINDOWS_SPECIAL_KEYS[f"f{number}"] = 0x70 + number - 1
+
+def parse_windows_hotkey(hotkey):
+    parts = [part.strip().lower() for part in (hotkey or "").split("+") if part.strip()]
+    if not parts:
+        return None
+
+    modifiers = 0
+    keys = []
+    for part in parts:
+        modifier = WINDOWS_MODIFIER_KEYS.get(part)
+        if modifier:
+            modifiers |= modifier
+        else:
+            keys.append(part)
+
+    if len(keys) != 1:
+        return None
+
+    key = keys[0]
+    if len(key) == 1 and "a" <= key <= "z":
+        virtual_key = ord(key.upper())
+    elif len(key) == 1 and "0" <= key <= "9":
+        virtual_key = ord(key)
+    else:
+        virtual_key = WINDOWS_SPECIAL_KEYS.get(key)
+
+    if not virtual_key:
+        return None
+
+    return modifiers, virtual_key
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+LowLevelKeyboardProc = ctypes.WINFUNCTYPE(
+    wintypes.LPARAM, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+)
+
+class KeyboardHotkeyManager:
+    def clear(self):
+        try:
+            keyboard.unhook_all_hotkeys()
+        except Exception:
+            pass
+
+    def register(self, hotkey, callback):
+        keyboard.add_hotkey(hotkey, callback)
+        return True
+
+class WindowsLowLevelHotkeyManager:
+    WH_KEYBOARD_LL = 13
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    WM_SYSKEYDOWN = 0x0104
+    WM_SYSKEYUP = 0x0105
+    KEY_DOWN_MESSAGES = {WM_KEYDOWN, WM_SYSKEYDOWN}
+    KEY_UP_MESSAGES = {WM_KEYUP, WM_SYSKEYUP}
+    VK_TO_MODIFIER = {
+        0x10: WINDOWS_MODIFIER_KEYS["shift"],
+        0xA0: WINDOWS_MODIFIER_KEYS["shift"],
+        0xA1: WINDOWS_MODIFIER_KEYS["shift"],
+        0x11: WINDOWS_MODIFIER_KEYS["ctrl"],
+        0xA2: WINDOWS_MODIFIER_KEYS["ctrl"],
+        0xA3: WINDOWS_MODIFIER_KEYS["ctrl"],
+        0x12: WINDOWS_MODIFIER_KEYS["alt"],
+        0xA4: WINDOWS_MODIFIER_KEYS["alt"],
+        0xA5: WINDOWS_MODIFIER_KEYS["alt"],
+        0x5B: WINDOWS_MODIFIER_KEYS["windows"],
+        0x5C: WINDOWS_MODIFIER_KEYS["windows"],
+    }
+
+    def __init__(self, install_hook=True, fallback=None):
+        self.fallback = fallback or KeyboardHotkeyManager()
+        self.callbacks = {}
+        self.active_modifiers = 0
+        self.active_hotkeys = set()
+        self.hook = None
+        self.user32 = None
+        self.kernel32 = None
+        self.hook_callback = None
+        if sys.platform == "win32":
+            self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+            self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            self.configure_api()
+            self.hook_callback = LowLevelKeyboardProc(self.low_level_keyboard_proc)
+            if install_hook:
+                self.install_hook()
+
+    def configure_api(self):
+        self.user32.SetWindowsHookExW.argtypes = [
+            ctypes.c_int,
+            LowLevelKeyboardProc,
+            wintypes.HINSTANCE,
+            wintypes.DWORD,
+        ]
+        self.user32.SetWindowsHookExW.restype = wintypes.HHOOK
+        self.user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+        self.user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+        self.user32.CallNextHookEx.argtypes = [
+            wintypes.HHOOK,
+            ctypes.c_int,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        self.user32.CallNextHookEx.restype = wintypes.LPARAM
+        self.kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        self.kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+    def install_hook(self):
+        if self.user32 is None or self.hook:
+            return bool(self.hook)
+
+        self.hook = self.user32.SetWindowsHookExW(
+            self.WH_KEYBOARD_LL,
+            self.hook_callback,
+            self.kernel32.GetModuleHandleW(None),
+            0,
+        )
+        if not self.hook:
+            print(f"Failed to install low-level hotkey hook: {ctypes.get_last_error()}")
+        return bool(self.hook)
+
+    def clear(self):
+        self.callbacks.clear()
+        self.active_modifiers = 0
+        self.active_hotkeys.clear()
+        try:
+            self.fallback.clear()
+        except Exception as e:
+            print(f"Failed to clear fallback hotkeys: {e}")
+
+    def register(self, hotkey, callback):
+        parsed = parse_windows_hotkey(hotkey)
+        if parsed is None:
+            return self.fallback.register(hotkey, callback)
+
+        if self.user32 is not None and not self.install_hook():
+            return self.fallback.register(hotkey, callback)
+
+        self.callbacks.setdefault(parsed, []).append(callback)
+        return True
+
+    def low_level_keyboard_proc(self, n_code, w_param, l_param):
+        try:
+            if n_code >= 0:
+                event = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                self.process_key_event(int(w_param), int(event.vkCode))
+        except Exception as e:
+            print(f"Failed to handle low-level hotkey event: {e}")
+        return self.user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+    def process_key_event(self, message, virtual_key):
+        if message in self.KEY_DOWN_MESSAGES:
+            self.handle_key_down(virtual_key)
+        elif message in self.KEY_UP_MESSAGES:
+            self.handle_key_up(virtual_key)
+
+    def handle_key_down(self, virtual_key):
+        modifier = self.VK_TO_MODIFIER.get(virtual_key)
+        if modifier:
+            self.active_modifiers |= modifier
+            return
+
+        hotkey = (self.active_modifiers, virtual_key)
+        if hotkey in self.callbacks and hotkey not in self.active_hotkeys:
+            self.active_hotkeys.add(hotkey)
+            for callback in list(self.callbacks[hotkey]):
+                callback()
+
+    def handle_key_up(self, virtual_key):
+        modifier = self.VK_TO_MODIFIER.get(virtual_key)
+        if modifier:
+            self.active_modifiers &= ~modifier
+            self.active_hotkeys.clear()
+            return
+
+        for hotkey in list(self.active_hotkeys):
+            if hotkey[1] == virtual_key:
+                self.active_hotkeys.discard(hotkey)
+
+def create_hotkey_manager(app):
+    if sys.platform == "win32":
+        return WindowsLowLevelHotkeyManager()
+    return KeyboardHotkeyManager()
+
 class SignalManager(QObject):
     recording_finished = pyqtSignal(str, str)
 
@@ -33,65 +260,299 @@ class HotkeyEdit(QLineEdit):
     Custom widget to capture hotkeys by pressing them.
     Maps Qt events to 'keyboard' library compatible strings.
     """
+    CAPTURE_PROMPT = "Press shortcut..."
+    sequence_captured = pyqtSignal(str)
+    capture_cancelled = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setPlaceholderText("Click to set hotkey...")
-        self.setReadOnly(True) 
+        self.setReadOnly(True)
         self.current_sequence = None
+        self.is_capturing = False
+        self._previous_text = ""
+        self._keyboard_hook = None
+        self._modifier_scan_codes = {
+            "ctrl": set(),
+            "alt": set(),
+            "shift": set(),
+            "windows": set(),
+        }
+        self._modifier_names_by_scan_code = self.build_modifier_scan_code_lookup()
+        self.sequence_captured.connect(self.finish_capture)
+        self.capture_cancelled.connect(self.cancel_capture)
+
+    def begin_capture(self):
+        if self.is_capturing:
+            return
+        self.is_capturing = True
+        self._previous_text = self.text()
+        self.setText(self.CAPTURE_PROMPT)
+        self.selectAll()
+        self.setStyleSheet("color: #666;")
+        self.start_keyboard_capture()
+
+    def finish_capture(self, sequence):
+        self.stop_keyboard_capture()
+        self.is_capturing = False
+        self.current_sequence = sequence or None
+        self.setStyleSheet("")
+        self.setText(sequence)
+        self.clearFocus()
+
+    def cancel_capture(self):
+        self.stop_keyboard_capture()
+        self.is_capturing = False
+        self.setStyleSheet("")
+        self.setText(self._previous_text)
+        self.clearFocus()
 
     def mousePressEvent(self, event):
         self.setFocus()
+        self.begin_capture()
         super().mousePressEvent(event)
 
-    def keyPressEvent(self, event):
-        key = event.key()
-        modifiers = event.modifiers()
-        
-        if key == Qt.Key.Key_Backspace or key == Qt.Key.Key_Delete:
-            self.clear()
-            self.current_sequence = None
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.begin_capture()
+
+    def focusOutEvent(self, event):
+        if self.is_capturing:
+            self.is_capturing = False
+            self.stop_keyboard_capture()
+            self.setStyleSheet("")
+            self.setText(self._previous_text)
+        super().focusOutEvent(event)
+
+    def start_keyboard_capture(self):
+        if self._keyboard_hook is not None:
             return
-            
-        if key == Qt.Key.Key_Escape:
-            self.clearFocus()
+        for scan_codes in self._modifier_scan_codes.values():
+            scan_codes.clear()
+        try:
+            self._keyboard_hook = keyboard.hook(self.handle_keyboard_hook)
+        except Exception as e:
+            print(f"Failed to start hotkey capture hook: {e}")
+
+    def stop_keyboard_capture(self):
+        if self._keyboard_hook is None:
+            return
+        try:
+            keyboard.unhook(self._keyboard_hook)
+        except Exception as e:
+            print(f"Failed to stop hotkey capture hook: {e}")
+        finally:
+            self._keyboard_hook = None
+            for scan_codes in self._modifier_scan_codes.values():
+                scan_codes.clear()
+
+    def handle_keyboard_hook(self, event):
+        if not self.is_capturing:
             return
 
-        if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+        key_name = self.normalize_hook_key_name(event.name)
+        modifier = self.modifier_name_for_hook_event(key_name, event.scan_code)
+        scan_code = event.scan_code
+
+        if modifier:
+            if event.event_type == "down":
+                self._modifier_scan_codes[modifier].add(scan_code)
+            elif event.event_type == "up":
+                self._modifier_scan_codes[modifier].discard(scan_code)
             return
 
+        if event.event_type != "down":
+            return
+
+        if key_name in ("esc", "escape"):
+            self.capture_cancelled.emit()
+            return
+
+        if key_name in ("backspace", "delete"):
+            self.sequence_captured.emit("")
+            return
+
+        sequence = self.format_hook_hotkey(key_name)
+        if sequence:
+            self.sequence_captured.emit(sequence)
+
+    def normalize_hook_key_name(self, key_name):
+        key_name = (key_name or "").lower()
+        aliases = {
+            "left windows": "windows",
+            "right windows": "windows",
+            "win": "windows",
+            "cmd": "windows",
+            "+": "plus",
+            ",": "comma",
+            " ": "space",
+            "return": "enter",
+        }
+        return aliases.get(key_name, key_name)
+
+    def modifier_name_for_hook_key(self, key_name):
+        aliases = {
+            "ctrl": "ctrl",
+            "control": "ctrl",
+            "left ctrl": "ctrl",
+            "right ctrl": "ctrl",
+            "alt": "alt",
+            "left alt": "alt",
+            "right alt": "alt",
+            "shift": "shift",
+            "left shift": "shift",
+            "right shift": "shift",
+            "windows": "windows",
+            "left windows": "windows",
+            "right windows": "windows",
+        }
+        return aliases.get(key_name)
+
+    def modifier_name_for_hook_event(self, key_name, scan_code):
+        if scan_code in self._modifier_names_by_scan_code:
+            return self._modifier_names_by_scan_code[scan_code]
+        return self.modifier_name_for_hook_key(key_name)
+
+    def build_modifier_scan_code_lookup(self):
+        lookup = {}
+        modifier_names = {
+            "ctrl": ("ctrl", "control", "left ctrl", "right ctrl"),
+            "alt": ("alt", "left alt", "right alt"),
+            "shift": ("shift", "left shift", "right shift"),
+            "windows": ("windows", "left windows", "right windows"),
+        }
+
+        for modifier, names in modifier_names.items():
+            for name in names:
+                try:
+                    scan_codes = keyboard.key_to_scan_codes(name, False)
+                except Exception:
+                    scan_codes = ()
+                for scan_code in scan_codes:
+                    lookup[scan_code] = modifier
+
+        return lookup
+
+    def format_hook_hotkey(self, key_name):
         parts = []
-        if modifiers & Qt.KeyboardModifier.ControlModifier: parts.append("ctrl")
-        if modifiers & Qt.KeyboardModifier.ShiftModifier:   parts.append("shift")
-        if modifiers & Qt.KeyboardModifier.AltModifier:     parts.append("alt")
-        if modifiers & Qt.KeyboardModifier.MetaModifier:    parts.append("windows")
+        for modifier in ("ctrl", "alt", "shift", "windows"):
+            if self._modifier_scan_codes[modifier]:
+                parts.append(modifier)
 
-        key_text = ""
-        if key >= 0x20 and key <= 0x7E:
-            key_text = chr(key).lower()
-        else:
-            key_map = {
-                Qt.Key.Key_F1: "f1", Qt.Key.Key_F2: "f2", Qt.Key.Key_F3: "f3", Qt.Key.Key_F4: "f4",
-                Qt.Key.Key_F5: "f5", Qt.Key.Key_F6: "f6", Qt.Key.Key_F7: "f7", Qt.Key.Key_F8: "f8",
-                Qt.Key.Key_F9: "f9", Qt.Key.Key_F10: "f10", Qt.Key.Key_F11: "f11", Qt.Key.Key_F12: "f12",
-                Qt.Key.Key_Left: "left", Qt.Key.Key_Right: "right", Qt.Key.Key_Up: "up", Qt.Key.Key_Down: "down",
-                Qt.Key.Key_Space: "space", Qt.Key.Key_Tab: "tab", Qt.Key.Key_Return: "enter", Qt.Key.Key_Enter: "enter",
-                Qt.Key.Key_Backspace: "backspace", Qt.Key.Key_Delete: "delete", Qt.Key.Key_Insert: "insert",
-                Qt.Key.Key_Home: "home", Qt.Key.Key_End: "end", Qt.Key.Key_PageUp: "pageup", Qt.Key.Key_PageDown: "pagedown",
-                Qt.Key.Key_CapsLock: "capslock", Qt.Key.Key_NumLock: "numlock", Qt.Key.Key_ScrollLock: "scrolllock",
-                Qt.Key.Key_Print: "print_screen", Qt.Key.Key_Pause: "pause"
-            }
-            key_text = key_map.get(key)
-            if not key_text:
-                try: key_text = QKeySequence(key).toString().lower()
-                except: pass
+        key_text = self.normalize_hook_key_name(key_name)
+        if not key_text or self.modifier_name_for_hook_key(key_text):
+            return ""
 
-        if key_text:
-            parts.append(key_text)
-            
-        final_hotkey = "+".join(parts)
-        self.setText(final_hotkey)
-        self.current_sequence = final_hotkey
-        self.clearFocus()
+        parts.append(key_text)
+        return "+".join(parts)
+
+    def event(self, event):
+        if event.type() == QEvent.Type.ShortcutOverride and self.is_capturing:
+            self.handle_hotkey_event(event)
+            event.accept()
+            return True
+        return super().event(event)
+
+    def keyPressEvent(self, event):
+        self.handle_hotkey_event(event)
+
+    def handle_hotkey_event(self, event):
+        key = self.key_from_event(event)
+        modifiers = event.modifiers()
+
+        if key in (Qt.Key.Key_Backspace.value, Qt.Key.Key_Delete.value):
+            self.finish_capture("")
+            return
+
+        if key == Qt.Key.Key_Escape.value:
+            self.cancel_capture()
+            return
+
+        if key in (
+            Qt.Key.Key_Control.value,
+            Qt.Key.Key_Shift.value,
+            Qt.Key.Key_Alt.value,
+            Qt.Key.Key_Meta.value,
+        ):
+            return
+
+        final_hotkey = self.format_hotkey(key, modifiers)
+        if final_hotkey:
+            self.finish_capture(final_hotkey)
+
+    def key_from_event(self, event):
+        key = event.key()
+        if key == Qt.Key.Key_unknown.value and event.nativeVirtualKey():
+            return event.nativeVirtualKey()
+        return key
+
+    def format_hotkey(self, key, modifiers):
+        parts = []
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            parts.append("ctrl")
+        if modifiers & Qt.KeyboardModifier.AltModifier:
+            parts.append("alt")
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            parts.append("shift")
+        if modifiers & Qt.KeyboardModifier.MetaModifier:
+            parts.append("windows")
+
+        key_text = self.key_to_text(key)
+        if not key_text:
+            return ""
+
+        parts.append(key_text)
+
+        return "+".join(parts)
+
+    def key_to_text(self, key):
+        if Qt.Key.Key_A.value <= key <= Qt.Key.Key_Z.value:
+            return chr(key).lower()
+
+        if Qt.Key.Key_0.value <= key <= Qt.Key.Key_9.value:
+            return chr(key)
+
+        key_map = {
+            Qt.Key.Key_F1.value: "f1",
+            Qt.Key.Key_F2.value: "f2",
+            Qt.Key.Key_F3.value: "f3",
+            Qt.Key.Key_F4.value: "f4",
+            Qt.Key.Key_F5.value: "f5",
+            Qt.Key.Key_F6.value: "f6",
+            Qt.Key.Key_F7.value: "f7",
+            Qt.Key.Key_F8.value: "f8",
+            Qt.Key.Key_F9.value: "f9",
+            Qt.Key.Key_F10.value: "f10",
+            Qt.Key.Key_F11.value: "f11",
+            Qt.Key.Key_F12.value: "f12",
+            Qt.Key.Key_Left.value: "left",
+            Qt.Key.Key_Right.value: "right",
+            Qt.Key.Key_Up.value: "up",
+            Qt.Key.Key_Down.value: "down",
+            Qt.Key.Key_Space.value: "space",
+            Qt.Key.Key_Plus.value: "plus",
+            Qt.Key.Key_Comma.value: "comma",
+            Qt.Key.Key_Tab.value: "tab",
+            Qt.Key.Key_Return.value: "enter",
+            Qt.Key.Key_Enter.value: "enter",
+            Qt.Key.Key_Insert.value: "insert",
+            Qt.Key.Key_Home.value: "home",
+            Qt.Key.Key_End.value: "end",
+            Qt.Key.Key_PageUp.value: "pageup",
+            Qt.Key.Key_PageDown.value: "pagedown",
+            Qt.Key.Key_CapsLock.value: "capslock",
+            Qt.Key.Key_NumLock.value: "numlock",
+            Qt.Key.Key_ScrollLock.value: "scrolllock",
+            Qt.Key.Key_Print.value: "print_screen",
+            Qt.Key.Key_Pause.value: "pause",
+        }
+        if key in key_map:
+            return key_map[key]
+
+        if 0x20 <= key <= 0x7E:
+            return chr(key).lower()
+
+        return ""
 
 class SettingsWindow(QMainWindow):
     settings_saved = pyqtSignal()
@@ -179,6 +640,15 @@ class SettingsWindow(QMainWindow):
         group_tray.setLayout(layout_tray)
         layout.addWidget(group_tray)
 
+        # Notifications
+        group_notifications = QGroupBox("Notifications")
+        layout_notifications = QVBoxLayout()
+        self.chk_notifications = QCheckBox("Show tray notifications")
+        self.chk_notifications.setChecked(True)
+        layout_notifications.addWidget(self.chk_notifications)
+        group_notifications.setLayout(layout_notifications)
+        layout.addWidget(group_notifications)
+
         # Post-Processing
         group_post = QGroupBox("Post-Processing & Clipboard")
         layout_post = QVBoxLayout()
@@ -202,9 +672,14 @@ class SettingsWindow(QMainWindow):
         self.hk_loop = HotkeyEdit()
         self.hk_both = HotkeyEdit()
         self.hk_stop = HotkeyEdit()
+        self.chk_stop_with_record_hotkeys = QCheckBox("Use record hotkeys to stop recording")
+        self.chk_stop_with_record_hotkeys.setToolTip("When enabled, pressing any record hotkey while recording stops the active recording instead of starting another mode.")
+        self.chk_stop_with_record_hotkeys.setChecked(True)
+        self.chk_stop_with_record_hotkeys.toggled.connect(self.update_stop_hotkey_state)
         layout_hotkeys.addRow("Record Mic:", self.hk_mic)
         layout_hotkeys.addRow("Record Loopback:", self.hk_loop)
         layout_hotkeys.addRow("Record Both:", self.hk_both)
+        layout_hotkeys.addRow("", self.chk_stop_with_record_hotkeys)
         layout_hotkeys.addRow("Stop Recording:", self.hk_stop)
         group_hotkeys.setLayout(layout_hotkeys)
         layout.addWidget(group_hotkeys)
@@ -215,6 +690,15 @@ class SettingsWindow(QMainWindow):
 
         self.refresh_hw()
         self.refresh_devices()
+        self.update_stop_hotkey_state()
+
+    def update_stop_hotkey_state(self):
+        use_record_hotkeys = self.chk_stop_with_record_hotkeys.isChecked()
+        self.hk_stop.setEnabled(not use_record_hotkeys)
+        if use_record_hotkeys:
+            self.hk_stop.setPlaceholderText("Using record hotkeys")
+        else:
+            self.hk_stop.setPlaceholderText("Click to set hotkey...")
 
     def refresh_devices(self):
         self.combo_mic.clear()
@@ -274,7 +758,7 @@ class SettingsWindow(QMainWindow):
     def load_settings(self):
         if os.path.exists(CONFIG_FILE):
             try:
-                with open(CONFIG_FILE, 'r') as f:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     
                 self.lbl_folder.setText(data.get("output_folder", os.getcwd()))
@@ -310,6 +794,11 @@ class SettingsWindow(QMainWindow):
                 self.chk_clipboard.setChecked(data.get("clipboard", False))
                 self.chk_delete.setChecked(data.get("delete_after", False))
                 self.chk_delete.setEnabled(self.chk_clipboard.isChecked())
+                self.chk_notifications.setChecked(data.get("show_notifications", True))
+                stop_with_record_hotkeys = data.get("stop_with_record_hotkeys")
+                if stop_with_record_hotkeys is None:
+                    stop_with_record_hotkeys = not bool(data.get("hk_stop", ""))
+                self.chk_stop_with_record_hotkeys.setChecked(stop_with_record_hotkeys)
 
                 self.hk_mic.setText(data.get("hk_mic", ""))
                 self.hk_loop.setText(data.get("hk_loop", ""))
@@ -317,12 +806,13 @@ class SettingsWindow(QMainWindow):
                 self.hk_stop.setText(data.get("hk_stop", ""))
             except Exception as e:
                 print(f"Error loading settings: {e}")
+        self.update_stop_hotkey_state()
 
     def save_settings(self):
         data = self.get_settings()
         try:
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(data, f)
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
             QMessageBox.information(self, "Settings", "Settings saved successfully.")
             self.settings_saved.emit()
         except Exception as e:
@@ -337,9 +827,11 @@ class SettingsWindow(QMainWindow):
             "output_folder": self.lbl_folder.text(),
             "format": self.combo_fmt.currentText(),
             "tray_click_mode": self.combo_left_click.currentText(),
+            "show_notifications": self.chk_notifications.isChecked(),
             "normalize": self.chk_normalize.isChecked(),
             "clipboard": self.chk_clipboard.isChecked(),
             "delete_after": self.chk_delete.isChecked(),
+            "stop_with_record_hotkeys": self.chk_stop_with_record_hotkeys.isChecked(),
             "hk_mic": self.hk_mic.text(),
             "hk_loop": self.hk_loop.text(),
             "hk_both": self.hk_both.text(),
@@ -369,8 +861,9 @@ class TrayApplication(QObject):
         
         self.settings_window = SettingsWindow()
         self.settings_window.settings_saved.connect(self.register_hotkeys)
+        self.hotkey_manager = create_hotkey_manager(self.app)
         
-        self.tray_icon.showMessage("Ready", "Left-click to toggle recording.", QSystemTrayIcon.MessageIcon.Information, 2000)
+        self.show_tray_notification("Ready", "Left-click to toggle recording.", QSystemTrayIcon.MessageIcon.Information, 2000)
         self.register_hotkeys()
         
         # Open settings on startup
@@ -427,19 +920,46 @@ class TrayApplication(QObject):
         self.tray_icon.setContextMenu(self.menu)
 
     def register_hotkeys(self):
-        try: keyboard.unhook_all_hotkeys() # Ensure no old hotkeys are active
-        except: pass
+        hotkey_manager = getattr(self, "hotkey_manager", None)
+        if hotkey_manager is None:
+            hotkey_manager = KeyboardHotkeyManager()
+            self.hotkey_manager = hotkey_manager
+        try:
+            hotkey_manager.clear()
+        except Exception as e:
+            print(f"Failed to clear hotkeys: {e}")
         settings = self.settings_window.get_settings()
         hk_mic = settings.get("hk_mic")
         hk_loop = settings.get("hk_loop")
         hk_both = settings.get("hk_both")
         hk_stop = settings.get("hk_stop")
         try:
-            if hk_mic: keyboard.add_hotkey(hk_mic, lambda: self.start_recording("mic"))
-            if hk_loop: keyboard.add_hotkey(hk_loop, lambda: self.start_recording("loopback"))
-            if hk_both: keyboard.add_hotkey(hk_both, lambda: self.start_recording("both"))
-            if hk_stop: keyboard.add_hotkey(hk_stop, self.stop_recording)
+            if hk_mic: hotkey_manager.register(hk_mic, lambda: self.toggle_recording("mic"))
+            if hk_loop: hotkey_manager.register(hk_loop, lambda: self.toggle_recording("loopback"))
+            if hk_both: hotkey_manager.register(hk_both, lambda: self.toggle_recording("both"))
+            if hk_stop and not settings.get("stop_with_record_hotkeys", True):
+                hotkey_manager.register(hk_stop, self.stop_recording)
         except Exception as e: print(f"Failed to register hotkeys: {e}")
+
+    def notifications_enabled(self):
+        try:
+            return self.settings_window.get_settings().get("show_notifications", True)
+        except Exception:
+            return True
+
+    def show_tray_notification(self, title, message, icon=QSystemTrayIcon.MessageIcon.Information, duration=2000):
+        notifications_enabled = getattr(self, "notifications_enabled", lambda: TrayApplication.notifications_enabled(self))
+        if notifications_enabled():
+            self.tray_icon.showMessage(title, message, icon, duration)
+
+    def toggle_recording(self, mode="mic"):
+        if self.recorder and self.recorder.is_alive():
+            settings = self.settings_window.get_settings()
+            if settings.get("stop_with_record_hotkeys", True):
+                self.stop_recording()
+            return
+
+        self.start_recording(mode)
 
     def on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -494,7 +1014,7 @@ class TrayApplication(QObject):
         self.action_stop.setEnabled(True)
         self.tray_icon.setIcon(QIcon(self.icon_rec_path)) 
         self.tray_icon.setToolTip(f"Recording ({mode})...")
-        self.tray_icon.showMessage("Started", f"Recording {mode}", QSystemTrayIcon.MessageIcon.NoIcon, 1000)
+        self.show_tray_notification("Started", f"Recording {mode}", QSystemTrayIcon.MessageIcon.NoIcon, 1000)
 
     def stop_recording(self):
         if self.recorder: self.recorder.stop()
@@ -509,7 +1029,7 @@ class TrayApplication(QObject):
         self.recorder = None
         
         if error:
-            self.tray_icon.showMessage("Error", f"Recording failed: {error}", QSystemTrayIcon.MessageIcon.Critical, 4000)
+            self.show_tray_notification("Error", f"Recording failed: {error}", QSystemTrayIcon.MessageIcon.Critical, 4000)
             return
             
         settings = self.settings_window.get_settings()
@@ -542,8 +1062,12 @@ class TrayApplication(QObject):
             except Exception as e:
                 msg += f"\nClipboard/Move error: {e}"
 
-        self.tray_icon.showMessage("Finished", msg, QSystemTrayIcon.MessageIcon.Information, 2000)
+        self.show_tray_notification("Finished", msg, QSystemTrayIcon.MessageIcon.Information, 2000)
 
     def exit_app(self):
         if self.recorder: self.recorder.stop()
+        try:
+            self.hotkey_manager.clear()
+        except Exception:
+            pass
         self.app.quit()

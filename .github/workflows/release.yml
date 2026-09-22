@@ -29,7 +29,7 @@ jobs:
           pip install pyinstaller
 
       - name: Build executable
-        run: pyinstaller --onefile --windowed --name QuickAudioRecorder main.py
+        run: pyinstaller --noconsole --onefile --name QuickAudioRecorder main.py
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

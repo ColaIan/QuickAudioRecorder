@@ -1,0 +1,13 @@
+[project]
+name = "quick-audio-recorder"
+version = "0.1.0"
+requires-python = ">=3.9"
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+# BLE001/S110: this app intentionally swallows broad exceptions in capture,
+# device-enumeration, and teardown paths so a flaky audio device or a window
+# that vanishes mid-enumeration never crashes the recorder.
+ignore = ["BLE001", "S110"]

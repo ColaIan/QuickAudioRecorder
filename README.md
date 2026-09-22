@@ -32,13 +32,14 @@ https://github.com/user-attachments/assets/14238816-c1ee-4914-9211-5f0007bfe999
 <img width="575" height="724" alt="image" src="https://github.com/user-attachments/assets/b35131bc-1ff8-41e1-87b5-1e472f9da981" />
 
 
--   **Capture Targets:**
-    -   🖥️ **Hardware Output Device:** Record system-wide audio directly from your chosen physical speakers.
-    -   🎯 **Specific Application:** Isolate and record audio *only* from a selected application (e.g., Discord or Firefox) without capturing background system noises, powered by WASAPI Process Loopback.
--   **Modes:**
-    -   🎤 **Microphone:** Record your voice.
-    -   🔊 **Loopback:** Record what you hear (or what the app is playing).
-    -   🎙️+🔊 **Both:** Record both tracks simultaneously (mixed into one file).
+-   **Capture Tracks:** Build your own track list — add as many tracks as you like, each configured independently as a kind:
+    -   🎤 **Input Device:** Record a microphone (or any input device).
+    -   🖥️ **Output (System Audio):** Record what you hear from a chosen speaker/loopback device.
+    -   🎯 **Application:** Isolate and record audio *only* from a selected application (e.g., Discord or Firefox) without capturing background system noises, powered by WASAPI Process Loopback.
+-   **Simultaneous Capture (mic + system/app):** There is no separate "Both" mode to pick. Microphone and system/app audio are recorded together simply by adding an **Input Device** track *and* an **Output (System Audio)** or **Application** track to the list. Every track in the list is captured at the same time.
+-   **Output Modes:**
+    -   🎚️ **Mixed (one file):** Combine all tracks into a single file (default).
+    -   🗂️ **Separate files:** Save each track to its own file, named from the track kind or application, e.g. `Recording_..._input` / `Recording_..._output` (or the app name), for editing them independently.
 -   **Post-Processing:**
     -   **Auto-Normalize:** Lifts the main voice/body of each source before mixing and limits sharp peaks so brief spikes do not bury the recording.
     -   **Clipboard Integration:** Automatically copies the file (or file path) to your clipboard.
@@ -57,8 +58,8 @@ https://github.com/user-attachments/assets/14238816-c1ee-4914-9211-5f0007bfe999
 ## Usage
 
 1.  The **Settings** window opens immediately upon launch.
-2.  Choose your **Capture Target** (Hardware Output or Specific Application).
-3.  Select your **Microphone** and **Output Folder**.
+2.  Add one or more **Capture Tracks** (Input Device, Output (System Audio), or Application).
+3.  Choose your **Output Folder**, **Format**, **Sample Rate**, and **Output mode** (Mixed or Separate files).
 4.  Set your **Hotkeys** and **Tray Icon Behavior** (optional).
 5.  Close the settings window to minimize to the tray. 
 6.  **Left-click** the tray icon or use your configured hotkey to start recording. Click again to stop.

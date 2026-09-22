@@ -1,7 +1,9 @@
-import subprocess
 import os
+import subprocess
+
+from PyQt6.QtCore import QMimeData, QUrl
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import QUrl, QMimeData
+
 
 def copy_file_to_clipboard(filepath):
     """
@@ -26,7 +28,13 @@ def copy_file_to_clipboard(filepath):
         ]
         
         # subprocess.run ensures we wait for it to finish
-        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
         
         if result.returncode == 0:
             return True, "Copied via PowerShell"

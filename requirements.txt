@@ -1,9 +1,10 @@
 PyQt6
-soundcard
+PyAudioWPatch
 soundfile
 numpy
 lameenc
 keyboard
 proc-tap
 psutil
+pywin32
 pytest

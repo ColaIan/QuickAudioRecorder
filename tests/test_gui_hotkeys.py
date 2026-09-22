@@ -1,5 +1,5 @@
-import os
 import json
+import os
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtGui import QKeyEvent
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 
 from gui import (
     HotkeyEdit,
@@ -254,18 +254,18 @@ class WindowsLowLevelHotkeyManagerTests(unittest.TestCase):
     def test_alt_shift_letter_triggers_from_low_level_events(self):
         manager = WindowsLowLevelHotkeyManager(install_hook=False)
         calls = []
-        manager.register("alt+shift+r", lambda: calls.append("mic"))
+        manager.register("alt+shift+r", lambda: calls.append("input"))
 
         manager.process_key_event(0x0104, 0xA4)
         manager.process_key_event(0x0100, 0xA0)
         manager.process_key_event(0x0100, 0x52)
 
-        self.assertEqual(calls, ["mic"])
+        self.assertEqual(calls, ["input"])
 
     def test_repeated_keydown_does_not_repeat_until_keyup(self):
         manager = WindowsLowLevelHotkeyManager(install_hook=False)
         calls = []
-        manager.register("alt+shift+r", lambda: calls.append("mic"))
+        manager.register("alt+shift+r", lambda: calls.append("input"))
 
         manager.process_key_event(0x0104, 0xA4)
         manager.process_key_event(0x0100, 0xA0)
@@ -274,12 +274,12 @@ class WindowsLowLevelHotkeyManagerTests(unittest.TestCase):
         manager.process_key_event(0x0101, 0x52)
         manager.process_key_event(0x0100, 0x52)
 
-        self.assertEqual(calls, ["mic", "mic"])
+        self.assertEqual(calls, ["input", "input"])
 
     def test_clear_removes_low_level_registrations(self):
         manager = WindowsLowLevelHotkeyManager(install_hook=False)
         calls = []
-        manager.register("alt+shift+r", lambda: calls.append("mic"))
+        manager.register("alt+shift+r", lambda: calls.append("input"))
 
         manager.clear()
         manager.process_key_event(0x0104, 0xA4)
@@ -289,7 +289,7 @@ class WindowsLowLevelHotkeyManagerTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
-class SettingsWindowLegacyHotkeyTests(unittest.TestCase):
+class SettingsWindowHotkeyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -305,8 +305,11 @@ class SettingsWindowLegacyHotkeyTests(unittest.TestCase):
             json.dump(settings, f)
 
         patches = [
-            patch("gui.get_devices", return_value=[{"name": "Default Mic", "id": "mic1"}]),
-            patch("gui.sc.default_microphone", return_value=SimpleNamespace(id="mic1")),
+            patch("gui.device_cache", return_value={
+                "inputs": [{"name": "Default Input", "id": "input1", "is_default": True}],
+                "speakers": [{"name": "Default Output", "id": "speaker-id", "is_default": True}],
+            }),
+            patch("gui.get_devices", return_value=[{"name": "Default Input", "id": "input1", "is_default": True}]),
         ]
         for patcher in patches:
             patcher.start()
@@ -316,122 +319,152 @@ class SettingsWindowLegacyHotkeyTests(unittest.TestCase):
         self.addCleanup(window.close)
         return window
 
-    def test_legacy_stop_hotkey_keeps_dedicated_stop_enabled(self):
-        window = self.make_settings_window({"hk_stop": "ctrl+alt+s"})
+    def test_toggle_hotkey_loaded_from_settings(self):
+        window = self.make_settings_window({"hk_toggle": "ctrl+alt+t"})
+        self.assertEqual(window.hk_toggle.text(), "ctrl+alt+t")
 
-        self.assertFalse(window.chk_stop_with_record_hotkeys.isChecked())
-        self.assertTrue(window.hk_stop.isEnabled())
-        self.assertEqual(window.hk_stop.text(), "ctrl+alt+s")
-
-    def test_legacy_settings_without_stop_hotkey_use_record_hotkeys_to_stop(self):
+    def test_default_no_toggle_hotkey(self):
         window = self.make_settings_window({})
-
-        self.assertTrue(window.chk_stop_with_record_hotkeys.isChecked())
-        self.assertFalse(window.hk_stop.isEnabled())
-
-    def test_explicit_stop_with_record_hotkeys_true_overrides_legacy_stop_hotkey(self):
-        window = self.make_settings_window(
-            {"hk_stop": "ctrl+alt+s", "stop_with_record_hotkeys": True}
-        )
-
-        self.assertTrue(window.chk_stop_with_record_hotkeys.isChecked())
-        self.assertFalse(window.hk_stop.isEnabled())
-        self.assertEqual(window.hk_stop.text(), "ctrl+alt+s")
-
-    def test_explicit_stop_with_record_hotkeys_false_keeps_dedicated_stop_enabled(self):
-        window = self.make_settings_window(
-            {"hk_stop": "ctrl+alt+s", "stop_with_record_hotkeys": False}
-        )
-
-        self.assertFalse(window.chk_stop_with_record_hotkeys.isChecked())
-        self.assertTrue(window.hk_stop.isEnabled())
-        self.assertEqual(window.hk_stop.text(), "ctrl+alt+s")
+        self.assertEqual(window.hk_toggle.text(), "")
 
 
 class TrayApplicationHotkeyTests(unittest.TestCase):
-    def test_register_hotkeys_uses_app_hotkey_manager(self):
+    def _make_subject(self, settings, extra=None):
+        subject = SimpleNamespace(
+            recorder=None,
+            settings_window=FakeSettingsWindow(settings),
+            signals=SimpleNamespace(recording_finished=SimpleNamespace(emit=lambda *a: None)),
+            action_toggle=SimpleNamespace(setText=lambda v: None),
+            tray_icon=SimpleNamespace(setIcon=lambda v: None, setToolTip=lambda v: None),
+            icon_rec_path="icon_rec.png",
+            show_tray_notification=lambda *a, **k: None,
+        )
+        if extra:
+            for key, value in extra.items():
+                setattr(subject, key, value)
+        return subject
+
+    def test_start_recording_builds_recorder_from_tracks(self):
+        settings = {
+            "tracks": [
+                {"kind": "input", "input_id": "input1"},
+                {"kind": "output", "speaker_id": "speaker-id"},
+                {"kind": "app", "target_pid": 1234},
+            ],
+            "output_folder": ".",
+            "format": "wav",
+            "sample_rate": "48000",
+            "stereo": True,
+            "normalize": False,
+            "output_mode": "mixed",
+        }
+        subject = self._make_subject(settings)
+
+        with patch("gui.AudioRecorder") as recorder_cls, patch(
+            "gui.psutil.pid_exists", return_value=True
+        ):
+            recorder_cls.return_value.is_alive.return_value = True
+            TrayApplication.start_recording(subject)
+
+        kwargs = recorder_cls.call_args.kwargs
+        self.assertEqual(kwargs["tracks"], settings["tracks"])
+        self.assertEqual(kwargs["sample_rate"], "48000")
+        self.assertNotIn("input_id", kwargs)
+        self.assertNotIn("target_pid", kwargs)
+        self.assertNotIn("quality", kwargs)
+
+    def test_start_recording_skips_missing_app(self):
+        settings = {
+            "tracks": [{"kind": "app", "target_pid": 1234}],
+            "output_folder": ".",
+            "format": "wav",
+            "sample_rate": "48000",
+            "stereo": False,
+            "normalize": False,
+            "output_mode": "mixed",
+        }
+        messages = []
+        subject = self._make_subject(
+            settings,
+            extra={
+                "tray_icon": SimpleNamespace(
+                    setIcon=lambda v: None,
+                    setToolTip=lambda v: None,
+                    showMessage=lambda *a: messages.append(a),
+                )
+            },
+        )
+
+        with patch("gui.AudioRecorder") as recorder_cls, patch(
+            "gui.psutil.pid_exists", return_value=False
+        ):
+            TrayApplication.start_recording(subject)
+
+        recorder_cls.assert_not_called()
+        self.assertTrue(messages)
+
+    def test_register_hotkeys_uses_single_toggle(self):
         hotkey_manager = FakeHotkeyManager()
         subject = SimpleNamespace(
             hotkey_manager=hotkey_manager,
-            settings_window=FakeSettingsWindow(
-                {
-                    "hk_mic": "alt+shift+r",
-                    "hk_loop": "ctrl+shift+l",
-                    "hk_both": "",
-                    "hk_stop": "ctrl+shift+s",
-                    "stop_with_record_hotkeys": False,
-                }
-            ),
+            settings_window=FakeSettingsWindow({"hk_toggle": "alt+shift+r"}),
             toggled=[],
-            stopped=False,
         )
-        subject.toggle_recording = lambda mode: subject.toggled.append(mode)
-        subject.stop_recording = lambda: setattr(subject, "stopped", True)
+        subject.toggle_recording = lambda: subject.toggled.append(True)
 
         with patch("gui.keyboard.add_hotkey") as add_hotkey, patch(
             "gui.keyboard.unhook_all_hotkeys"
-        ) as unhook_all_hotkeys:
+        ) as unhook:
             TrayApplication.register_hotkeys(subject)
 
         self.assertTrue(hotkey_manager.cleared)
-        self.assertEqual([item[0] for item in hotkey_manager.registrations], [
-            "alt+shift+r",
-            "ctrl+shift+l",
-            "ctrl+shift+s",
-        ])
+        self.assertEqual([item[0] for item in hotkey_manager.registrations], ["alt+shift+r"])
         self.assertFalse(add_hotkey.called)
-        self.assertFalse(unhook_all_hotkeys.called)
+        self.assertFalse(unhook.called)
 
         hotkey_manager.registrations[0][1]()
-        hotkey_manager.registrations[2][1]()
+        self.assertEqual(subject.toggled, [True])
 
-        self.assertEqual(subject.toggled, ["mic"])
-        self.assertTrue(subject.stopped)
-
-    def test_record_hotkey_stops_active_recording_when_option_enabled(self):
+    def test_toggle_recording_stops_active_recording(self):
         subject = SimpleNamespace(
             recorder=FakeRecorder(alive=True),
-            settings_window=FakeSettingsWindow({"stop_with_record_hotkeys": True}),
             stopped=False,
-            started=None,
+            started=False,
         )
         subject.stop_recording = lambda: setattr(subject, "stopped", True)
-        subject.start_recording = lambda mode: setattr(subject, "started", mode)
+        subject.start_recording = lambda: setattr(subject, "started", True)
 
-        TrayApplication.toggle_recording(subject, "mic")
+        TrayApplication.toggle_recording(subject)
 
         self.assertTrue(subject.stopped)
-        self.assertIsNone(subject.started)
+        self.assertFalse(subject.started)
 
-    def test_record_hotkey_does_not_switch_mode_when_option_disabled(self):
-        subject = SimpleNamespace(
-            recorder=FakeRecorder(alive=True),
-            settings_window=FakeSettingsWindow({"stop_with_record_hotkeys": False}),
-            stopped=False,
-            started=None,
-        )
-        subject.stop_recording = lambda: setattr(subject, "stopped", True)
-        subject.start_recording = lambda mode: setattr(subject, "started", mode)
-
-        TrayApplication.toggle_recording(subject, "loopback")
-
-        self.assertFalse(subject.stopped)
-        self.assertIsNone(subject.started)
-
-    def test_record_hotkey_starts_recording_when_idle(self):
+    def test_toggle_recording_starts_when_idle(self):
         subject = SimpleNamespace(
             recorder=None,
-            settings_window=FakeSettingsWindow({"stop_with_record_hotkeys": True}),
             stopped=False,
-            started=None,
+            started=False,
         )
         subject.stop_recording = lambda: setattr(subject, "stopped", True)
-        subject.start_recording = lambda mode: setattr(subject, "started", mode)
+        subject.start_recording = lambda: setattr(subject, "started", True)
 
-        TrayApplication.toggle_recording(subject, "both")
+        TrayApplication.toggle_recording(subject)
 
         self.assertFalse(subject.stopped)
-        self.assertEqual(subject.started, "both")
+        self.assertTrue(subject.started)
+
+    def test_tray_click_toggles_recording(self):
+        subject = SimpleNamespace(
+            recorder=None,
+            toggled=False,
+        )
+        subject.toggle_recording = lambda: setattr(subject, "toggled", True)
+
+        TrayApplication.on_tray_activated(
+            subject, QSystemTrayIcon.ActivationReason.Trigger
+        )
+
+        self.assertTrue(subject.toggled)
 
 
 class TrayApplicationNotificationTests(unittest.TestCase):
@@ -441,7 +474,7 @@ class TrayApplicationNotificationTests(unittest.TestCase):
             settings_window=FakeSettingsWindow({"show_notifications": False}),
         )
 
-        TrayApplication.show_tray_notification(subject, "Started", "Recording mic")
+        TrayApplication.show_tray_notification(subject, "Started", "Recording input")
 
         self.assertEqual(subject.tray_icon.messages, [])
 
@@ -451,11 +484,11 @@ class TrayApplicationNotificationTests(unittest.TestCase):
             settings_window=FakeSettingsWindow({"show_notifications": True}),
         )
 
-        TrayApplication.show_tray_notification(subject, "Started", "Recording mic", duration=1234)
+        TrayApplication.show_tray_notification(subject, "Started", "Recording input", duration=1234)
 
         self.assertEqual(len(subject.tray_icon.messages), 1)
         self.assertEqual(subject.tray_icon.messages[0][0], "Started")
-        self.assertEqual(subject.tray_icon.messages[0][1], "Recording mic")
+        self.assertEqual(subject.tray_icon.messages[0][1], "Recording input")
         self.assertEqual(subject.tray_icon.messages[0][3], 1234)
 
 

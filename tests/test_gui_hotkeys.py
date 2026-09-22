@@ -301,7 +301,7 @@ class SettingsWindowHotkeyTests(unittest.TestCase):
         os.chdir(temp_dir.name)
         self.addCleanup(os.chdir, previous_cwd)
 
-        with open("settings.json", "w", encoding="utf-8") as f:
+        with open("QuickAudioRecorder.settings.json", "w", encoding="utf-8") as f:
             json.dump(settings, f)
 
         patches = [

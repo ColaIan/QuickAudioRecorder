@@ -49,7 +49,7 @@ from process_utils import (
     get_foreground_window_info,
 )
 
-CONFIG_FILE = "settings.json"
+CONFIG_FILE = "QuickAudioRecorder.settings.json"
 
 
 def window_thumbnail(hwnd, width=48, height=32):

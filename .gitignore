@@ -19,7 +19,7 @@ dist/
 *.exe
 
 # User Settings
-settings.json
+*settings.json
 
 # IDE
 .vscode/

@@ -18,7 +18,7 @@ def app():
 
 @pytest.fixture
 def window(app, tmp_path, monkeypatch):
-    monkeypatch.setattr(gui, "CONFIG_FILE", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(gui, "CONFIG_FILE", str(tmp_path / "QuickAudioRecorder.settings.json"))
     return gui.SettingsWindow()
 
 

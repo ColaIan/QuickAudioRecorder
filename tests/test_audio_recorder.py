@@ -4,6 +4,7 @@ Uses MockPyAudio + MockStream to simulate PortAudio callback-based capture
 without touching real hardware. Tests the full capture → write → resample pipeline.
 """
 import os
+import sys
 import threading
 from queue import Empty, Queue
 from unittest.mock import MagicMock, patch
@@ -771,6 +772,83 @@ def test_audio_recorder_app_crash(mock_proctap_recorder, tmp_path):
     assert os.path.exists(recorder.final_filepath)
     assert "terminated" in str(recorder.error_message).lower() or \
            "closed" in str(recorder.error_message).lower()
+
+
+def _install_fake_proctap(monkeypatch, start_error):
+    import types
+
+    fake = types.ModuleType("proctap")
+
+    class FakeCapture:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def start(self):
+            raise start_error
+
+        def read(self, timeout=0.1):
+            return None
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    fake.ProcessAudioCapture = FakeCapture
+    monkeypatch.setitem(sys.modules, "proctap", fake)
+
+
+class _RecordingSender:
+    def __init__(self):
+        self.messages = []
+
+    def send(self, message):
+        self.messages.append(message)
+
+    def close(self):
+        pass
+
+
+def test_process_tap_worker_reports_failure(monkeypatch):
+    monkeypatch.setattr(audio_recorder, "_pid_alive", lambda pid: True)
+    _install_fake_proctap(monkeypatch, RuntimeError("Failed to start capture: HRESULT=0x80070005"))
+    sender = _RecordingSender()
+
+    audio_recorder._process_tap_worker(4242, sender)
+
+    assert sender.messages == [
+        ("error", "failed", "Failed to start capture: HRESULT=0x80070005")
+    ]
+
+
+def test_process_tap_worker_reports_closed_when_target_exited(monkeypatch):
+    monkeypatch.setattr(audio_recorder, "_pid_alive", lambda pid: False)
+    _install_fake_proctap(monkeypatch, RuntimeError("capture ended"))
+    sender = _RecordingSender()
+
+    audio_recorder._process_tap_worker(4242, sender)
+
+    assert sender.messages[0][0] == "error"
+    assert sender.messages[0][1] == "closed"
+
+
+def test_decode_message_unpacks_data_tuple():
+    payload = b"\x00\x01\x02\x03"
+    assert audio_recorder._decode_message(("data", payload)) == ("data", payload)
+
+
+def test_decode_message_passes_raw_bytes_through():
+    payload = b"\x00\x01"
+    assert audio_recorder._decode_message(payload) == ("data", payload)
+
+
+def test_decode_message_keeps_error_details():
+    assert audio_recorder._decode_message(("error", "failed", "boom")) == (
+        "error",
+        "failed",
+        "boom",
+    )
 
 
 def test_prime_device_cache_enumerates_once(monkeypatch):

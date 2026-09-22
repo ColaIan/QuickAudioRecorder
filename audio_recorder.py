@@ -265,6 +265,7 @@ class ProcTapRecorder(threading.Thread):
         self.channels = 2
         self.stop_event = threading.Event()
         self.error = None
+        self.exit_reason = None
         self.max_amp_seen = 0.0
         self.chunks_read = 0
 
@@ -285,13 +286,20 @@ class ProcTapRecorder(threading.Thread):
                 silence = np.zeros((int(0.1 * self.samplerate), self.channels), dtype=np.float32)
                 while not self.stop_event.is_set():
                     if receiver.poll(0.1):
-                        data = receiver.recv_bytes()
-                        np_data = np.frombuffer(data, dtype=np.float32).reshape(-1, self.channels)
+                        message = _decode_message(receiver.recv())
+                        if message[0] == "error":
+                            self.exit_reason = message[1]
+                            raise RuntimeError(message[2])
+                        np_data = np.frombuffer(message[1], dtype=np.float32).reshape(-1, self.channels)
                         f_wav.write(np_data)
                         self.max_amp_seen = max(self.max_amp_seen, float(np.max(np.abs(np_data))))
                         self.chunks_read += 1
                     elif process is not None and not process.is_alive():
-                        raise RuntimeError("Process audio capture stopped unexpectedly.")
+                        if _pid_alive(self.pid):
+                            self.exit_reason = "failed"
+                            raise RuntimeError("Process audio capture stopped unexpectedly.")
+                        self.exit_reason = "closed"
+                        raise RuntimeError("The application stopped or exited.")
                     else:
                         f_wav.write(silence)
         except Exception as e:
@@ -311,6 +319,26 @@ class ProcTapRecorder(threading.Thread):
         self.join()
 
 
+def _pid_alive(pid):
+    """Return True if the target process is still running."""
+    try:
+        import psutil
+
+        return psutil.pid_exists(int(pid))
+    except Exception:
+        return True
+
+
+def _decode_message(message):
+    """Normalize a capture-pipe message to ``("data", bytes)`` or ``("error", reason, detail)``."""
+    if isinstance(message, tuple) and message:
+        if message[0] == "error":
+            return ("error", message[1], message[2])
+        if message[0] == "data":
+            return ("data", message[1])
+    return ("data", message)
+
+
 def _process_tap_worker(pid, sender):
     """Run native process output capture outside the tray process."""
     capture = None
@@ -322,9 +350,16 @@ def _process_tap_worker(pid, sender):
         while True:
             data = capture.read(timeout=0.1)
             if data:
-                sender.send_bytes(data)
-    except Exception:
-        pass
+                sender.send(("data", data))
+    except Exception as e:
+        # Report the real failure back to the parent instead of dying silently,
+        # which would otherwise surface as a misleading "application closed".
+        try:
+            reason = "failed" if _pid_alive(pid) else "closed"
+            detail = str(e) or type(e).__name__
+            sender.send(("error", reason, detail))
+        except Exception:
+            pass
     finally:
         if capture is not None:
             try:
@@ -434,7 +469,12 @@ class AudioRecorder(threading.Thread):
                     if not recorder.is_alive():
                         self.stop_event.set()
                         if getattr(recorder, "error", None):
-                            self.error_message = f"Recording stopped because the application closed. ({recorder.error})"
+                            if getattr(recorder, "exit_reason", None) == "closed":
+                                self.error_message = (
+                                    f"Recording stopped because the application closed. ({recorder.error})"
+                                )
+                            else:
+                                self.error_message = f"Audio capture failed: {recorder.error}"
                         break
                 self.stop_event.wait(0.05)
 
